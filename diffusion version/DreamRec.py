@@ -6,12 +6,10 @@ import argparse
 import torch
 from torch import nn
 import torch.nn.functional as F
-import torch.optim.lr_scheduler as lr_scheduler
 import os
 import logging
 import time as Time
-from utility import pad_history,calculate_hit,extract_axis_1
-from collections import Counter
+from utility import calculate_hit,extract_axis_1
 from Modules_ori import *
 
 logging.getLogger().setLevel(logging.INFO)
@@ -39,7 +37,7 @@ def parse_args():
                         help='beta start of diffusion')
     parser.add_argument('--lr', type=float, default=0.005,
                         help='Learning rate.')
-    parser.add_argument('--l2_decay', type=float, default=0,
+    parser.add_argument('--l2_decay', type=float, default=0.0001,
                         help='l2 loss reg coef.')
     parser.add_argument('--cuda', type=int, default=0,
                         help='cuda device.')
@@ -64,19 +62,20 @@ def parse_args():
 args = parse_args()
 
 def setup_seed(seed):
-     torch.manual_seed(seed)
-     torch.cuda.manual_seed_all(seed)
-     np.random.seed(seed)
-     random.seed(seed)
-     torch.backends.cudnn.deterministic = True
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
 
 setup_seed(args.random_seed)
-
 
 def extract(a, t, x_shape):
     batch_size = t.shape[0]
     out = a.gather(-1, t.cpu())
     return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
+
+
 
 def linear_beta_schedule(timesteps, beta_start, beta_end):
     beta_start = beta_start
@@ -114,6 +113,8 @@ def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
         betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
     return np.array(betas)
 
+
+
 class diffusion():
     def __init__(self, timesteps, beta_start, beta_end, w):
         self.timesteps = timesteps
@@ -143,7 +144,6 @@ class diffusion():
         self.sqrt_recip_alphas_cumprod = torch.sqrt(1. / self.alphas_cumprod)
         self.sqrt_recipm1_alphas_cumprod = torch.sqrt(1. / self.alphas_cumprod - 1)
 
-
         self.posterior_mean_coef1 = self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
         self.posterior_mean_coef2 = (1. - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1. - self.alphas_cumprod)
 
@@ -151,30 +151,24 @@ class diffusion():
         self.posterior_variance = self.betas * (1. - self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
     
     def q_sample(self, x_start, t, noise=None):
-        # print(self.betas)
         if noise is None:
             noise = torch.randn_like(x_start)
-            # noise = torch.randn_like(x_start) / 100
+
         sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
         sqrt_one_minus_alphas_cumprod_t = extract(
             self.sqrt_one_minus_alphas_cumprod, t, x_start.shape
         )
+
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
     def p_losses(self, denoise_model, x_start, h, t, noise=None, loss_type="l2"):
-        # 
         if noise is None:
             noise = torch.randn_like(x_start) 
-            # noise = torch.randn_like(x_start) / 100
-        
-        # 
-        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
         predicted_x = denoise_model(x_noisy, h, t)
 
-        
-        # 
         if loss_type == 'l1':
             loss = F.l1_loss(x_start, predicted_x)
         elif loss_type == 'l2':
@@ -185,18 +179,12 @@ class diffusion():
             raise NotImplementedError()
 
         return loss, predicted_x
-
-    def predict_noise_from_start(self, x_t, t, x0):
-        return (
-            (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) / \
-            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
-        )
     
     @torch.no_grad()
     def p_sample(self, model_forward, model_forward_uncon, x, h, t, t_index):
-
         x_start = (1 + self.w) * model_forward(x, h, t) - self.w * model_forward_uncon(x, t)
         x_t = x 
+
         model_mean = (
             extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
             extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
@@ -213,7 +201,6 @@ class diffusion():
     @torch.no_grad()
     def sample(self, model_forward, model_forward_uncon, h):
         x = torch.randn_like(h)
-        # x = torch.randn_like(h) / 100
 
         for n in reversed(range(0, self.timesteps)):
             x = self.p_sample(model_forward, model_forward_uncon, x, h, torch.full((h.shape[0], ), n, device=device, dtype=torch.long), n)
@@ -236,7 +223,8 @@ class SinusoidalPositionEmbeddings(nn.Module):
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
         return embeddings
     
-        
+
+
 class Tenc(nn.Module):
     def __init__(self, hidden_size, item_num, state_size, dropout, diffuser_type, device, num_heads=1):
         super(Tenc, self).__init__()
@@ -260,7 +248,7 @@ class Tenc(nn.Module):
             num_embeddings=state_size,
             embedding_dim=hidden_size
         )
-        # emb_dropout is added
+
         self.emb_dropout = nn.Dropout(dropout)
         self.ln_1 = nn.LayerNorm(hidden_size)
         self.ln_2 = nn.LayerNorm(hidden_size)
@@ -268,12 +256,6 @@ class Tenc(nn.Module):
         self.mh_attn = MultiHeadAttention(hidden_size, hidden_size, num_heads, dropout)
         self.feed_forward = PositionwiseFeedForward(hidden_size, hidden_size, dropout)
         self.s_fc = nn.Linear(hidden_size, item_num)
-        # self.ac_func = nn.ReLU()
-
-        # self.step_embeddings = nn.Embedding(
-        #     num_embeddings=50,
-        #     embedding_dim=hidden_size
-        # )
 
         self.step_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(self.hidden_size),
@@ -281,18 +263,6 @@ class Tenc(nn.Module):
             nn.GELU(),
             nn.Linear(self.hidden_size*2, self.hidden_size),
         )
-
-        self.emb_mlp = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(self.hidden_size, self.hidden_size*2)
-        )
-
-        self.diff_mlp = nn.Sequential(
-            nn.Linear(self.hidden_size * 3, self.hidden_size*2),
-            nn.GELU(),
-            nn.Linear(self.hidden_size*2, self.hidden_size),
-        )
-
 
         if self.diffuser_type =='mlp1':
             self.diffuser = nn.Sequential(
@@ -305,11 +275,8 @@ class Tenc(nn.Module):
             nn.Linear(self.hidden_size*2, self.hidden_size)
         )
 
-
     def forward(self, x, h, step):
-
         t = self.step_mlp(step)
-
 
         if self.diffuser_type == 'mlp1':
             res = self.diffuser(torch.cat((x, h, t), dim=1))
@@ -330,15 +297,11 @@ class Tenc(nn.Module):
             
         return res
 
-        # return x
-
     def cacu_x(self, x):
         x = self.item_embeddings(x)
-
         return x
 
     def cacu_h(self, states, len_states, p):
-        #hidden
         inputs_emb = self.item_embeddings(states)
         inputs_emb += self.positional_embeddings(torch.arange(self.state_size).to(self.device))
         seq = self.emb_dropout(inputs_emb)
@@ -358,14 +321,11 @@ class Tenc(nn.Module):
         mask = torch.cat([maske1d] * D, dim=1)
         mask = mask.to(self.device)
 
-        # print(h.device, self.none_embedding(torch.tensor([0]).to(self.device)).device, mask.device)
         h = h * mask + self.none_embedding(torch.tensor([0]).to(self.device)) * (1-mask)
-
 
         return h  
     
     def predict(self, states, len_states, diff):
-        #hidden
         inputs_emb = self.item_embeddings(states)
         inputs_emb += self.positional_embeddings(torch.arange(self.state_size).to(self.device))
         seq = self.emb_dropout(inputs_emb)
@@ -392,17 +352,11 @@ def evaluate(model, test_data, diff, device):
     eval_data=pd.read_pickle(os.path.join(data_directory, test_data))
 
     batch_size = 100
-    evaluated=0
-    total_clicks=1.0
     total_purchase = 0.0
-    total_reward = [0, 0, 0, 0]
-    hit_clicks=[0,0,0,0]
-    ndcg_clicks=[0,0,0,0]
     hit_purchase=[0,0,0,0]
     ndcg_purchase=[0,0,0,0]
 
     seq, len_seq, target = list(eval_data['seq'].values), list(eval_data['len_seq'].values), list(eval_data['next'].values)
-
 
     num_total = len(seq)
 
@@ -421,7 +375,6 @@ def evaluate(model, test_data, diff, device):
 
         total_purchase+=batch_size
  
-
     hr_list = []
     ndcg_list = []
     print('{:<10s} {:<10s} {:<10s} {:<10s} {:<10s} {:<10s}'.format('HR@'+str(topk[0]), 'NDCG@'+str(topk[0]), 'HR@'+str(topk[1]), 'NDCG@'+str(topk[1]), 'HR@'+str(topk[2]), 'NDCG@'+str(topk[2])))
@@ -441,22 +394,23 @@ def evaluate(model, test_data, diff, device):
 
 
 if __name__ == '__main__':
-
-    # args = parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda)
 
-    data_directory = './data/' + args.data
-    data_statis = pd.read_pickle(
-        os.path.join(data_directory, 'data_statis.df'))  # read data statistics, includeing seq_size and item_num
-    seq_size = data_statis['seq_size'][0]  # the length of history to define the seq
-    item_num = data_statis['item_num'][0]  # total number of items
+    data_directory = '../data/' + args.data
+
+    data_statis = pd.read_pickle(os.path.join(data_directory, 'data_statis.df'))
+    
+    seq_size = data_statis['seq_size'][0]
+    item_num = data_statis['item_num'][0]
+
     topk=[10, 20, 50]
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    
     timesteps = args.timesteps
 
-
     model = Tenc(args.hidden_factor,item_num, seq_size, args.dropout_rate, args.diffuser_type, device)
+    
     diff = diffusion(args.timesteps, args.beta_start, args.beta_end, args.w)
 
     if args.optimizer == 'adam':
@@ -467,15 +421,11 @@ if __name__ == '__main__':
         optimizer = torch.optim.Adagrad(model.parameters(), lr=args.lr, eps=1e-8, weight_decay=args.l2_decay)
     elif args.optimizer =='rmsprop':
         optimizer = torch.optim.RMSprop(model.parameters(), lr=args.lr, eps=1e-8, weight_decay=args.l2_decay)
-
-    # scheduler = lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1, total_iters=20)
     
     model.to(device)
-    # optimizer.to(device)
 
     train_data = pd.read_pickle(os.path.join(data_directory, 'train_data.df'))
 
-    total_step=0
     hr_max = 0
     best_epoch = 0
 
@@ -498,36 +448,32 @@ if __name__ == '__main__':
             target = target.to(device)
             len_seq = len_seq.to(device)
 
-
             x_start = model.cacu_x(target)
-
             h = model.cacu_h(seq, len_seq, args.p)
-
             n = torch.randint(0, args.timesteps, (args.batch_size, ), device=device).long()
+
             loss, predicted_x = diff.p_losses(model, x_start, h, n, loss_type='l2')
 
             loss.backward()
             optimizer.step()
 
-
-        # scheduler.step()
         if args.report_epoch:
             if i % 1 == 0:
                 print("Epoch {:03d}; ".format(i) + 'Train loss: {:.4f}; '.format(loss) + "Time cost: " + Time.strftime(
                         "%H: %M: %S", Time.gmtime(Time.time()-start_time)))
 
-            if (i + 1) % 10 == 0:
-                
+            if (i + 1) % 5 == 0:
                 eval_start = Time.time()
-                print('-------------------------- VAL PHRASE --------------------------')
-                _ = evaluate(model, 'val_data.df', diff, device)
-                print('-------------------------- TEST PHRASE -------------------------')
+                print('-------------------------- VAL PHASE --------------------------')
+                hr = evaluate(model, 'val_data.df', diff, device)
+                print('-------------------------- TEST PHASE -------------------------')
                 _ = evaluate(model, 'test_data.df', diff, device)
                 print("Evalution cost: " + Time.strftime("%H: %M: %S", Time.gmtime(Time.time()-eval_start)))
                 print('----------------------------------------------------------------')
 
-
-
-
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
-
+                if hr > hr_max:
+                    hr_max = hr
+                    best_epoch = i
+                    # torch.save(model.state_dict(), f'best_model.pt')
+    
+    print(f"Best epoch: {best_epoch}, Best HR@20: {hr_max}")
